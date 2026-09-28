@@ -24,7 +24,7 @@ public class GlobalExceptionHandler {
     @ExceptionHandler({MethodArgumentNotValidException.class, HttpMessageNotReadableException.class})
     public ResponseEntity<ErrorResponse> invalidRequest(Exception exception) {
         return ResponseEntity.badRequest().body(new ErrorResponse("INVALID_REQUEST",
-                "Request must contain a non-blank message string."));
+                "Request body is invalid. Check required fields and their formats."));
     }
 
     @ExceptionHandler(Exception.class)
