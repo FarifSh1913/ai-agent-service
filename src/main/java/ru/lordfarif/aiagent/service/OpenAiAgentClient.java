@@ -22,6 +22,9 @@ import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestClientResponseException;
 import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.DeserializationFeature;
+import tools.jackson.core.JacksonException;
 import ru.lordfarif.aiagent.config.OpenAiProperties;
 import ru.lordfarif.aiagent.dto.AgentChatResponse;
 import ru.lordfarif.aiagent.dto.AgentImage;
@@ -31,6 +34,7 @@ import tools.jackson.databind.json.JsonMapper;
 public class OpenAiAgentClient {
     private static final Logger log = LoggerFactory.getLogger(OpenAiAgentClient.class);
     private final OpenAiProperties properties;
+    private ObjectMapper objectMapper = JsonMapper.builder().findAndAddModules().build();
     private final RestClient.Builder builder;
     private final HttpClient httpClient;
     private final Duration timeout;
@@ -39,10 +43,11 @@ public class OpenAiAgentClient {
     private final DocumentServiceClient documentServiceClient;
 
     @Autowired
-    public OpenAiAgentClient(OpenAiProperties properties, OpenAiImageClient imageClient) {
+    public OpenAiAgentClient(OpenAiProperties properties, OpenAiImageClient imageClient, ObjectMapper objectMapper) {
         this(properties, RestClient.builder().baseUrl("https://api.openai.com/v1"),
                 Duration.ofSeconds(180), Duration.ofMillis(500), imageClient,
                 new DocumentServiceClient(new ru.lordfarif.aiagent.config.DocumentServiceProperties()));
+        this.objectMapper = objectMapper;
     }
 
     OpenAiAgentClient(OpenAiProperties properties, RestClient.Builder builder,
@@ -68,6 +73,67 @@ public class OpenAiAgentClient {
         this.timeout = timeout;
         this.pollInterval = pollInterval;
         this.httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
+    }
+
+    /** Runs a new, independent session and returns only its structured business result. */
+    public <T> T runAgent(String agentId, Object input, Class<T> responseType) {
+        return runAgent(agentId, input, responseType, (sessionId, result) -> result);
+    }
+
+    /** Supplies a log-safe session ID to business post-processing without exposing session metadata in the DTO. */
+    public <T> T runAgent(String agentId, Object input, Class<T> responseType,
+                          java.util.function.BiFunction<String, T, T> postProcessor) {
+        requireConfiguration(properties.getApiKey(), "OPENAI_API_KEY");
+        requireConfiguration(agentId, "OPENAI_NEARBY_PLACES_AGENT_ID");
+        long deadline = System.nanoTime() + Duration.ofMillis(properties.getPolling().getTimeoutMs()).toNanos();
+        String sessionId = null;
+        try {
+            String serializedInput = objectMapper.writeValueAsString(input);
+            JsonNode session = call(deadline, client -> client.post().uri("/agents/sessions")
+                    .body(Map.of("agent_id", agentId, "environment", Map.of("type", "none"),
+                            "input", serializedInput, "stream", false)).retrieve().body(JsonNode.class));
+            sessionId = requiredText(session, "id");
+            while (true) {
+                log.info("OpenAI structured agent poll: sessionId={}, status={}",
+                        safeId(sessionId), safeLabel(session.path("status")));
+                checkSession(session);
+                if ("idle".equals(requiredText(session, "status"))) break;
+                pause(deadline, Duration.ofMillis(properties.getPolling().getIntervalMs()));
+                session = retrieveSession(sessionId, deadline);
+            }
+            var items = new ArrayList<JsonNode>();
+            readItems(sessionId, deadline, items);
+            JsonNode finalAnswer = null;
+            for (JsonNode item : items) {
+                if ("message".equals(item.path("type").asString())
+                        && "assistant".equals(item.path("role").asString())
+                        && "final_answer".equals(item.path("phase").asString())
+                        && "completed".equals(item.path("status").asString())) {
+                    finalAnswer = item;
+                }
+            }
+            if (finalAnswer == null) {
+                throw upstream("MISSING_FINAL_ANSWER", "Agent returned no completed final answer.");
+            }
+            JsonNode content = finalAnswer.path("content");
+            if (!content.isArray() || content.isEmpty() || !content.path(0).path("text").isString()) {
+                throw upstream("INVALID_AGENT_JSON", "Agent returned an invalid JSON result.");
+            }
+            try {
+                // JsonNode already unescapes the outer JSON string. Parse exactly once into our DTO.
+                T result = objectMapper.readerFor(responseType)
+                        .with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                        .readValue(content.path(0).path("text").asString());
+                if (result == null) throw upstream("INVALID_AGENT_JSON", "Agent returned an invalid JSON result.");
+                remaining(deadline);
+                return postProcessor.apply(safeId(sessionId), result);
+            } catch (JacksonException exception) {
+                throw upstream("INVALID_AGENT_JSON", "Agent returned an invalid JSON result.");
+            }
+        } catch (AgentException exception) {
+            log.warn("OpenAI structured agent failed: sessionId={}, code={}", safeId(sessionId), exception.getCode());
+            throw exception;
+        }
     }
 
     public AgentChatResponse chat(String message, String requestedSessionId) {
@@ -272,6 +338,7 @@ public class OpenAiAgentClient {
     private void checkSession(JsonNode session, boolean allowFunctionActions) {
         try {
             switch (requiredText(session, "status")) {
+                case "error": throw upstream("AGENT_SESSION_ERROR", "OpenAI reported a session error.");
                 case "failed": throw upstream("AGENT_SESSION_FAILED", "Agent session failed.");
                 case "cancelled": throw upstream("AGENT_SESSION_CANCELLED", "Agent session was cancelled.");
                 case "incomplete": throw upstream("AGENT_SESSION_INCOMPLETE", "Agent session stopped before completing.");
@@ -424,7 +491,7 @@ public class OpenAiAgentClient {
         String value = node.asString();
         if (value == null) return "not_observed";
         return switch (value) {
-            case "idle", "queued", "in_progress", "waiting", "completed", "failed", "cancelled", "incomplete", "requires_action",
+            case "error", "idle", "queued", "in_progress", "waiting", "completed", "failed", "cancelled", "incomplete", "requires_action",
                  "message", "reasoning", "web_search_call", "function_call", "function_call_output", "environment_connection",
                  "generate_fence_image", "start_camunda_approval",
                  "mcp_call", "command_execution", "agent_message", "create_subagent_call", "send_subagent_input_call",
@@ -484,8 +551,12 @@ public class OpenAiAgentClient {
     }
 
     private void pause(long deadline) {
+        pause(deadline, pollInterval);
+    }
+
+    private void pause(long deadline, Duration interval) {
         try {
-            Thread.sleep(Duration.ofNanos(Math.min(pollInterval.toNanos(), remaining(deadline).toNanos())));
+            Thread.sleep(Duration.ofNanos(Math.min(interval.toNanos(), remaining(deadline).toNanos())));
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
             throw new AgentException(HttpStatus.SERVICE_UNAVAILABLE, "REQUEST_INTERRUPTED", "Agent request interrupted.");

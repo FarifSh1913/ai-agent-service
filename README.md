@@ -154,3 +154,101 @@ java -jar target/ai-agent-service-0.0.1-SNAPSHOT.jar
 ```
 
 Тесты controller, service, validation и HTTP-клиента работают без реальных ключей. HTTP-тесты используют локальный mock server и проверяют первый запрос, продолжение той же session без повторного создания, новый turn вместо исторического, заголовки, pagination, invalid sessionId, ошибки 4xx/5xx и timeout. Для проверки реального ответа нужны действующие env и доступ к сохранённому агенту.
+
+## Nearby Places Agent
+
+`POST /api/agents/nearby-places` запускает отдельного логического агента в этом же приложении:
+`NearbyPlacesController → NearbyPlacesAgentService → OpenAiAgentClient.runAgent(...)`.
+HTTP transport, deadline, обработка ошибок и пагинация переиспользуются из существующего клиента.
+Текущий chat flow с turns и tools сохранён. Платформа проекта остаётся Java 21 / Spring Boot 4.1.1;
+переход на Boot 3 в рамках добавления endpoint не выполнялся.
+
+Настройки в `application.yml` / окружении:
+
+| Property | Env | По умолчанию |
+| --- | --- | --- |
+| `openai.api-key` | `OPENAI_API_KEY` | пусто; без ключа endpoint возвращает 503 |
+| `openai.agents.nearby-places.id` | `OPENAI_NEARBY_PLACES_AGENT_ID` | `agent_2fc10e837c4b4ef3bab6cb6b0659b6d2f8a8a83acb5f4cdcb6` |
+| `openai.polling.interval-ms` | `OPENAI_POLLING_INTERVAL_MS` | `750` |
+| `openai.polling.timeout-ms` | `OPENAI_POLLING_TIMEOUT_MS` | `60000` |
+
+Последние две настройки относятся к структурированному `runAgent`: общий deadline включает создание
+session, polling и чтение всех страниц items. Для существующего чата сохранены 180 секунд / 500 мс.
+Интервалы должны быть положительными; для рабочего окружения рекомендуется polling 500–1000 мс.
+`OPENAI_AGENT_ID` остаётся настройкой прежнего чата и не нужен для Nearby Places.
+
+Запрос сериализуется внедрённым Spring ObjectMapper в JSON-строку поля `input`.
+Новая session создаётся с `environment.type=none`, `stream=false`; при `in_progress` выполняется polling,
+при `idle` читаются items с `order=asc&limit=100`, включая последующие страницы.
+Из последнего `message / assistant / final_answer / completed` извлекается `content[0].text`.
+Строка десериализуется в `NearbyPlacesResponse`; backend возвращает только `places`.
+`{"places":[]}` — корректный ответ 200. Отсутствующий/null `places` превращается в пустой список; null-элементы удаляются при post-processing.
+
+```sh
+curl --fail-with-body -X POST http://localhost:8082/api/agents/nearby-places \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "city": "Москва",
+    "date": "2026-09-29",
+    "timeFrom": "18:00",
+    "timeTo": "23:00",
+    "budget": 20000,
+    "company": "couple",
+    "preferences": ["cafe", "restaurant"],
+    "event": {
+      "id": 226684,
+      "title": "мюзикл «Плакса»",
+      "address": "Пушкинская пл., д. 2",
+      "lat": 55.7658,
+      "lon": 37.6050,
+      "price": 1000,
+      "source": "KudaGo"
+    }
+  }'
+```
+
+Ошибки возвращаются существующим `GlobalExceptionHandler` в формате `{"code":"...","error":"..."}`:
+
+- 400 `INVALID_REQUEST` — невалидный JSON, обязательные поля, дата, время HH:mm, бюджет или координаты.
+- 502 `AGENT_SESSION_FAILED`, `AGENT_SESSION_CANCELLED`, `AGENT_SESSION_ERROR` — ошибка session.
+- 502 `MISSING_FINAL_ANSWER` — нет завершённого итогового сообщения.
+- 502 `INVALID_AGENT_JSON` — невалидный JSON/структура бизнес-ответа.
+- 502 `INVALID_OPENAI_RESPONSE` / `OPENAI_REQUEST_REJECTED` — нарушение протокола или отказ OpenAI.
+- 503 `OPENAI_NOT_CONFIGURED`, `OPENAI_RATE_LIMIT`, `OPENAI_UNAVAILABLE`, `OPENAI_CONNECTION_ERROR` — конфигурация или недоступность upstream.
+- 504 `OPENAI_TIMEOUT` — истёк общий deadline либо HTTP timeout.
+
+Логируются безопасный sessionId, статус и код ошибки; ключ, Authorization, входной JSON,
+ответ агента и тело ошибки OpenAI в логи не попадают.
+Тесты `NearbyPlacesAgentClientTest` и `NearbyPlacesControllerTest` работают без реального OpenAI;
+полная сборка с регрессионными тестами: `./mvnw clean package`.
+
+
+### Нормализация Nearby Places
+
+После десериализации `final_answer` метод `NearbyPlacesAgentService.normalize(...)` выполняет
+post-processing через перегрузку `runAgent(..., postProcessor)`. Клиент передаёт безопасный для логов
+sessionId и DTO, сохраняя прежний вариант `runAgent` и HTTP/polling без изменений.
+
+- Удаляет null-элементы и места с `openAtRequestedTime=false`; `null` означает неизвестные часы работы и сохраняется.
+- Применяет `trim()` к title/type/address/reason/source/sourceUrl. Пустые address/source/sourceUrl становятся null;
+  title не преобразуется из пустой строки в null.
+- Из обычной Markdown-ссылки `[текст](https://example.com)` извлекает URL. Обычные HTTP(S) URL сохраняет;
+  некорректные/неподтверждённые ссылки заменяет null. Сложный Markdown не разбирается.
+- Пересчитывает distanceMeters по Haversine в `GeoDistance`, если обе пары координат присутствуют,
+  конечны и находятся в допустимых диапазонах. Расстояние по прямой округляется до метра и возвращается как Double;
+  это не длина пешеходного маршрута. Без координат сохраняется значение агента, включая null или 0.
+- Не изменяет estimatedPrice и lat/lon, не выполняет geocoding.
+- Оставляет пустой итоговый список валидным результатом. Null вместо всего ответа и malformed JSON остаются ошибкой 502.
+
+INFO `Nearby places normalized` содержит sessionId, placesBefore, placesAfter,
+sourceUrlsNormalized и distancesRecalculated. placesBefore включает null-элементы исходного списка;
+счётчики URL и расстояний относятся к оставшимся местам. Изменение URL включает trim, извлечение Markdown URL
+и замену некорректной ссылки на null. Содержимое ответа и секреты не логируются.
+
+Инструкции сохранённого агента в репозитории не обнаружены. В OpenAI UI добавьте вручную:
+
+> Поле sourceUrl всегда возвращай как обычную абсолютную URL-строку. Не используй Markdown-ссылки, квадратные или круглые скобки. Если URL не удалось подтвердить, верни null.
+
+> Не возвращай места, если точно известно, что openAtRequestedTime = false.
+
+Backend не обновляет определение агента автоматически. agent_id сохранён.
